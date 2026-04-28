@@ -319,14 +319,28 @@ func (t *Transport) fetchCSRFToken(ctx context.Context) error {
 		return err
 	}
 
-	// 2026-04-29 patch v2: Fall back to GET whenever HEAD returns no token.
-	// BASIS 740 (ECC EhP7) returns HTTP 200 on HEAD but omits X-CSRF-Token header.
-	// Previous patch only fell back on HTTP 400 — not sufficient for all BASIS versions.
-	// GET works correctly on all BASIS versions including 740, 752, and S/4HANA.
+	// CSRF fetch strategy (patched 2026-04-29):
+	// 1. Try HEAD on /core/discovery (fast, works on 752+ and S/4HANA)
+	// 2. If no token: try GET on /core/discovery (BASIS 740 ignores HEAD for CSRF)
+	// 3. If still no token: try GET on /sap/bc/adt/discovery (fallback for older systems
+	//    where /core/discovery exists but never returns CSRF tokens e.g. ECC EhP7)
+
+	// Step 2: GET on same endpoint
 	if token == "" || token == "Required" {
 		token, status, err = doFetch(http.MethodGet)
 		if err != nil {
 			return err
+		}
+	}
+
+	// Step 3: GET on standard /sap/bc/adt/discovery
+	if token == "" || token == "Required" {
+		if fallbackURL, ferr := t.buildURL("/sap/bc/adt/discovery", nil); ferr == nil {
+			reqURL = fallbackURL
+			token, status, err = doFetch(http.MethodGet)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
