@@ -319,9 +319,11 @@ func (t *Transport) fetchCSRFToken(ctx context.Context) error {
 		return err
 	}
 
-	// 2026-04-27 patch: BASIS 740 (ECC EhP7) returns HTTP 400 on HEAD with no token.
-	// Fall back to GET which works correctly on all BASIS versions.
-	if (token == "" || token == "Required") && status == http.StatusBadRequest {
+	// 2026-04-29 patch v2: Fall back to GET whenever HEAD returns no token.
+	// BASIS 740 (ECC EhP7) returns HTTP 200 on HEAD but omits X-CSRF-Token header.
+	// Previous patch only fell back on HTTP 400 — not sufficient for all BASIS versions.
+	// GET works correctly on all BASIS versions including 740, 752, and S/4HANA.
+	if token == "" || token == "Required" {
 		token, status, err = doFetch(http.MethodGet)
 		if err != nil {
 			return err
