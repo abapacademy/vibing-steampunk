@@ -282,54 +282,60 @@ func (t *Transport) retryRequest(ctx context.Context, path string, opts *Request
 }
 
 // fetchCSRFToken retrieves a CSRF token from the server.
-// Uses /core/discovery with HEAD for optimal performance (~25ms vs ~56s for GET on /discovery)
+// Uses HEAD for optimal performance; falls back to GET for older BASIS systems
+// (e.g. BASIS 740 / ECC EhP7) where HEAD returns 400 with no CSRF token.
 func (t *Transport) fetchCSRFToken(ctx context.Context) error {
 	reqURL, err := t.buildURL("/sap/bc/adt/core/discovery", nil)
 	if err != nil {
 		return fmt.Errorf("building URL: %w", err)
 	}
 
-	// Use HEAD instead of GET for faster CSRF token fetch (~5s vs ~56s on slow systems)
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, reqURL, nil)
+	doFetch := func(method string) (string, int, error) {
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, nil)
+		if err != nil {
+			return "", 0, fmt.Errorf("creating request: %w", err)
+		}
+		if t.config.HasBasicAuth() {
+			req.SetBasicAuth(t.config.Username, t.config.Password)
+		}
+		t.addCookies(req)
+		req.Header.Set("X-CSRF-Token", "fetch")
+		req.Header.Set("Accept", "*/*")
+		if t.config.SessionType == SessionStateful {
+			req.Header.Set("X-sap-adt-sessiontype", "stateful")
+		}
+		resp, err := t.httpClient.Do(req)
+		if err != nil {
+			return "", 0, fmt.Errorf("executing request: %w", err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.Header.Get("X-CSRF-Token"), resp.StatusCode, nil
+	}
+
+	// Try HEAD first (faster ~25ms vs ~56ms for GET)
+	token, status, err := doFetch(http.MethodHead)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return err
 	}
 
-	// Set authentication
-	if t.config.HasBasicAuth() {
-		req.SetBasicAuth(t.config.Username, t.config.Password)
-	}
-	t.addCookies(req)
-	req.Header.Set("X-CSRF-Token", "fetch")
-	req.Header.Set("Accept", "*/*")
-
-	// Set session type header for stateful sessions
-	if t.config.SessionType == SessionStateful {
-		req.Header.Set("X-sap-adt-sessiontype", "stateful")
+	// 2026-04-27 patch: BASIS 740 (ECC EhP7) returns HTTP 400 on HEAD with no token.
+	// Fall back to GET which works correctly on all BASIS versions.
+	if (token == "" || token == "Required") && status == http.StatusBadRequest {
+		token, status, err = doFetch(http.MethodGet)
+		if err != nil {
+			return err
+		}
 	}
 
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("executing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Drain body to allow connection reuse
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	// Note: HEAD may return 400 but still provides CSRF token in headers
-	// But 401/403 indicates auth failure and won't have a valid token
-
-	token := resp.Header.Get("X-CSRF-Token")
 	if token == "" || token == "Required" {
-		// Provide better error message based on status code
-		switch resp.StatusCode {
+		switch status {
 		case http.StatusUnauthorized:
 			return fmt.Errorf("authentication failed (401): check username/password")
 		case http.StatusForbidden:
 			return fmt.Errorf("access forbidden (403): check user authorizations")
 		default:
-			return fmt.Errorf("no CSRF token in response (HTTP %d)", resp.StatusCode)
+			return fmt.Errorf("no CSRF token in response (HTTP %d)", status)
 		}
 	}
 
